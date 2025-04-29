@@ -1,0 +1,213 @@
+data Logical = 
+    | Join(left: Logical, right: Logical, type: JoinType, predicate: Scalar)
+    | Filter(child: Logical, predicate: Scalar)
+    | Project(child: Logical, expressions: [Scalar])
+    | Sort(child: Logical, order_by: [Bool]) // true is ascending
+    \ Get(table_name: String)
+
+data Scalar =
+    | ColumnRef(idx: I64)
+    | Literal =
+        | IntLiteral(value: I64)
+        | StringLiteral(value: String)
+        \ BoolLiteral(value: Bool)
+    | Arithmetic =
+        | Mult(left: Scalar, right: Scalar)
+        | Add(left: Scalar, right: Scalar)
+        | Sub(left: Scalar, right: Scalar)
+        \ Div(left: Scalar, right: Scalar)
+    | Predicate =
+        | And(children: [Scalar])
+        | Or(children: [Scalar])
+        | Not(child: Scalar)
+        \ Equals(left: Scalar, right: Scalar)
+    | Function =
+        | Cast(expr: Scalar, target_type: String)
+        | Substring(str: Scalar, start: Scalar, length: Scalar)
+        \ Concat(args: [Scalar])
+    \ AggregateExpr =
+        | Sum(expr: Scalar)
+        | Count(expr: Scalar)
+        | Min(expr: Scalar)
+        | Max(expr: Scalar)
+        \ Avg(expr: Scalar)
+
+data JoinType =
+    | Inner
+    | Left
+    | Right
+    | Full
+    \ Semi
+
+data Physical =
+    | Scan(table_name: String)
+    | PhysFilter(child: Physical, predicate: Scalar)
+    | PhysProject(child: Physical, expressions: [Scalar])
+    | PhysSort(child: Physical, order_by: [Bool]) // true is ascending 
+    \ PhysJoin =
+        | HashJoin(
+                build_side: Physical,
+                probe_side: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+        | MergeJoin(
+                left: Physical,
+                right: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+        \ NestedLoopJoin(
+                outer: Physical,
+                inner: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+
+data Catalog
+data LogicalProperties(schema: Schema)
+data PhysicalProperties(order_by: [Bool])  // e.g., define sorting, partitioning, etc.
+data CostedProperties    // e.g., define cost model, statistics, etc.
+data Statistics          // e.g., define histograms, MCVs, etc.
+
+data Schema(columns: [Column])
+data Column(name: String, data_type: String, is_nullable: Bool)
+
+fn (expr: Scalar) fold_add = match expr
+  | Add(IntLiteral(i1), IntLiteral(i2)) -> IntLiteral(i1 + i2)
+  | Add(IntLiteral(0), right) -> right
+  | Add(left, IntLiteral(0)) -> left
+  \ Add(left, right) ->
+  let
+    folded = Add(left.fold_scalar(), right.fold_scalar())
+  in
+    folded.fold_scalar()
+
+fn (expr: Scalar) fold_mult = match expr
+  | Mult(IntLiteral(i1), IntLiteral(i2)) -> IntLiteral(i1 * i2)
+  | Mult(IntLiteral(1), right) -> right
+  | Mult(IntLiteral(0), right) -> IntLiteral(0)
+  | Mult(left, IntLiteral(1)) -> left
+  | Mult(left, IntLiteral(0)) -> IntLiteral(0)
+  \ Mult(left, right) ->
+  let
+    folded = Mult(left.fold_scalar(), right.fold_scalar())
+  in
+    folded.fold_scalar()
+
+fn (expr: Scalar) fold_sub = match expr
+  | Sub(IntLiteral(i1), IntLiteral(i2)) -> IntLiteral(i1 - i2)
+  | Sub(left, IntLiteral(0)) -> left
+  \ Sub(left, right) -> 
+  let
+    folded = Sub(left.fold_scalar(), right.fold_scalar())
+  in
+    folded.fold_scalar()
+
+fn (expr: Scalar) fold_div = match expr
+  | Div(IntLiteral(i1), IntLiteral(i2)) -> IntLiteral(i1 / i2)
+  | Div(left, IntLiteral(1)) -> left
+  \ Div(left, right) -> 
+  let
+    folded = Div(left.fold_scalar(), right.fold_scalar())
+  in
+    folded.fold_scalar()
+
+fn fold_equals(left: Scalar, right: Scalar) =
+  match left
+  | IntLiteral(v1) ->
+    match right
+    | IntLiteral(v2) ->
+      if v1 == v2 then
+        BoolLiteral(true)
+      else
+        BoolLiteral(false)
+    \ _ -> Equals(left, right)
+  | StringLiteral(v1) ->
+    match right
+    | StringLiteral(v2) ->
+      if v1 == v2 then
+        BoolLiteral(true)
+      else
+        BoolLiteral(false)
+    \ _ -> Equals(left, right)
+  | BoolLiteral(v1) ->
+    match right
+    | BoolLiteral(v2) ->
+      if v1 == v2 then
+        BoolLiteral(true)
+      else
+        BoolLiteral(false)
+    \ _ -> Equals(left, right)
+  \ _ -> Equals(left, right)
+ 
+fn (expr: Scalar) fold_scalar =
+  match expr
+  // Arithmetic
+  | Add(left, right) -> expr.fold_add()
+  | Mult(left, right) -> expr.fold_mult()
+  | Sub(left, right) -> expr.fold_sub()
+  | Div(left, right) -> expr.fold_div()
+  // Predicate
+  // And(children)
+  // Or(children)
+  | Not(child) ->
+    let
+      folded_child = child.fold_scalar(),
+    in
+      match folded_child
+      | BoolLiteral(true) -> BoolLiteral(false)
+      | BoolLiteral(false) -> BoolLiteral(true)
+      \ _ -> folded_child
+  | Equals(left, right) ->
+    let
+      folded_left = left.fold_scalar(),
+      folded_right = right.fold_scalar(),
+    in
+      fold_equals(folded_left, folded_right)
+  // Function
+  | Cast(expr, target_type) -> Cast(expr.fold_scalar(), target_type)
+  | Substring(str, start, length) -> Substring(str.fold_scalar(), start.fold_scalar(), length.fold_scalar())
+  // | Concat(args)
+  // AggregateExpr
+  | Sum(expr) ->
+    let
+      folded_expr = expr.fold_scalar(),
+    in
+      match folded_expr
+      | IntLiteral(v) -> IntLiteral(v)
+      \ _ -> Sum(folded_expr)
+  | Count(expr) -> Count(expr.fold_scalar())
+  | Min(expr) ->
+    let
+      folded_expr = expr.fold_scalar(),
+    in
+      match folded_expr
+      | IntLiteral(v) -> IntLiteral(v)
+      | StringLiteral(v) -> StringLiteral(v)
+      \ _ -> Min(folded_expr)
+  | Max(expr) ->
+    let
+      folded_expr = expr.fold_scalar(),
+    in
+      match folded_expr
+      | IntLiteral(v) -> IntLiteral(v)
+      | StringLiteral(v) -> StringLiteral(v)
+      \ _ -> Max(folded_expr)
+  | Avg(expr) ->
+    let
+      folded_expr = expr.fold_scalar(),
+    in
+      match folded_expr
+      | IntLiteral(v) -> IntLiteral(v)
+      \ _ -> Avg(folded_expr)
+  \ _ -> expr
+
+[transform]
+fn (plan : Logical) fold_constants: Logical? = match plan
+  | Join(left, right, type, pred) ->
+      Join(left, right, type, pred.fold_scalar())
+  | Filter(child, pred) ->
+      Filter(child, pred.fold_scalar())
+  // | Project(child, expressions) -> expressions.map(expr -> expr.fold_scalar())
+  \ _ -> none
