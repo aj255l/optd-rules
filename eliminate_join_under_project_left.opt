@@ -1,0 +1,224 @@
+//    ██████╗ ██████╗ ████████╗ ██████╗ ██████╗ ███╗   ██╗ 
+//   ██╔═══██╗██╔══██╗╚══██╔══╝██╔═══██╗██════╝ ████╗  ██║
+//   ██║   ██║██████╔╝   ██║   ██║    ╚╝██████╗ ██╔██╗ ██║
+//   ██║   ██║██╔═══╝    ██║   ██║  ███╗██════╝ ██║╚██╗██║
+//   ╚██████╔╝██║        ██║   ╚██████╔╝██████╗ ██║ ╚████║
+//    ╚═════╝ ╚═╝        ╚═╝    ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
+// EliminateJoinUnderProjectLeft replaces an InnerJoin or LeftJoin with its left
+// input when:
+// 1. The project doesn't use columns from the join's right input.
+// 2. The join does not duplicate any left rows.
+// 3. The join does not filter any left rows.
+//
+// Note: EliminateJoinUnderProjectLeft should stay above EliminateProject so that
+// it has a chance to fire before the Project can be removed.
+//
+// It is possible for references to the right input of the join to be replaced by
+// equivalent columns from the left input. This is handled by adding projections
+// that map the left column to the equivalent right column (leftCol AS rightCol).
+//
+// It is ok to call MergeProjections without checking CanMergeProjections because
+// RemapProjectionCols returns projections that only reference columns from the
+// left input, and ProjectRemappedCols only projects columns from the right side
+// of the join.
+// [EliminateJoinUnderProjectLeft, Normalize]
+// (Project
+//     $join:(InnerJoin | LeftJoin $left:* $right:*) &
+//         (* Join is between KEY columns *)
+//         (JoinDoesNotDuplicateLeftRows $join) &
+//         (* Should be true if over an inner or left join *)
+//         (JoinPreservesLeftRows $join)
+//     (* Projections out don't matter since we're deciding what to do with 
+//      * whatever is under the project *)
+//     $projections:*
+//     (* Passthrough does matter because we need to make sure it's all left *)
+//     $passthrough:* &
+//         (CanRemapCols
+//             $fromCols:(UnionCols
+//                 $passthrough
+//                 (ProjectionOuterCols $projections)
+//             )
+//             $leftCols:(OutputCols $left)
+//             $fds:(FuncDeps $join)
+//         ) &
+//         (* This is optimizer specific, but just asks if they can remap. *)
+//         (CanUseImprovedJoinElimination $fromCols $leftCols)
+// )
+// =>
+// (Project
+//     $left
+//     (MergeProjections
+//         (RemapProjectionCols $projections $leftCols $fds)
+//         (ProjectRemappedCols $passthrough $leftCols $fds)
+//         $passthrough
+//     )
+//     (DifferenceCols $passthrough (OutputCols $right))
+// )
+
+data Logical = 
+    | Join(left: Logical, right: Logical, type: JoinType, predicate: Scalar)
+    | Filter(child: Logical, predicate: Scalar)
+    | Project(child: Logical, expressions: [Scalar])
+    | Sort(child: Logical, order_by: [Bool]) // true is ascending
+    \ Get(table_name: String)
+
+data Scalar =
+    | ColumnRef(idx: I64)
+    | Literal =
+        | IntLiteral(value: I64)
+        | StringLiteral(value: String)
+        \ BoolLiteral(value: Bool)
+    | Arithmetic =
+        | Mult(left: Scalar, right: Scalar)
+        | Add(left: Scalar, right: Scalar)
+        | Sub(left: Scalar, right: Scalar)
+        \ Div(left: Scalar, right: Scalar)
+    | Predicate =
+        | And(children: [Scalar])
+        | Or(children: [Scalar])
+        | Not(child: Scalar)
+        \ Equals(left: Scalar, right: Scalar)
+    | Function =
+        | Cast(expr: Scalar, target_type: String)
+        | Substring(str: Scalar, start: Scalar, length: Scalar)
+        \ Concat(args: [Scalar])
+    \ AggregateExpr =
+        | Sum(expr: Scalar)
+        | Count(expr: Scalar)
+        | Min(expr: Scalar)
+        | Max(expr: Scalar)
+        \ Avg(expr: Scalar)
+
+data JoinType =
+    | Inner
+    | Left
+    | Right
+    | Full
+    \ Semi
+
+data Physical =
+    | Scan(table_name: String)
+    | PhysFilter(child: Physical, predicate: Scalar)
+    | PhysProject(child: Physical, expressions: [Scalar])
+    | PhysSort(child: Physical, order_by: [Bool]) // true is ascending 
+    \ PhysJoin =
+        | HashJoin(
+                build_side: Physical,
+                probe_side: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+        | MergeJoin(
+                left: Physical,
+                right: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+        \ NestedLoopJoin(
+                outer: Physical,
+                inner: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+
+data Catalog
+data LogicalProperties(schema: Schema)
+data PhysicalProperties(order_by: [Bool])  // e.g., define sorting, partitioning, etc.
+data CostedProperties    // e.g., define cost model, statistics, etc.
+data Statistics          // e.g., define histograms, MCVs, etc.
+
+data Schema(columns: [Column])
+data Column(name: String, data_type: String, is_nullable: Bool)
+
+// Check if the join is over key columns
+fn join_does_not_duplicate_left_rows(x: Logical): Bool = 
+    match x
+    | Join(left, right, type, pred) -> true
+    \ _ -> false
+
+fn (type: JoinType) is_inner_or_left: Bool =
+    match type
+    | Inner -> true
+    | Left -> true
+    \ _ -> false
+
+fn (expr: Scalar) get_column_refs: [ColumnRef] =
+    match expr
+    | ColumnRef(i) -> [ColumnRef(i)]
+    // Arithmetic
+    | Mult(left, right) -> left.get_column_refs() ++ right.get_column_refs()
+    | Add(left, right) -> left.get_column_refs() ++ right.get_column_refs()
+    | Sub(left, right) -> left.get_column_refs() ++ right.get_column_refs()
+    | Div(left, right) -> left.get_column_refs() ++ right.get_column_refs()
+    // Predicate
+    | And(children) -> children.get_column_refs_list()
+    | Or(children) -> children.get_column_refs_list()
+    | Not(child) -> child.get_column_refs()
+    | Equals(left, right) -> left.get_column_refs() ++ right.get_column_refs()
+    // Function
+    | Cast(expr, target_type) -> expr.get_column_refs()
+    | Substring(str, start, length) -> str.get_column_refs() ++ start.get_column_refs() ++ length.get_column_refs()
+    | Concat(args) -> args.get_column_refs_list()
+    // AggregateExpr
+    | Sum(expr) -> expr.get_column_refs()
+    | Count(expr) -> expr.get_column_refs()
+    | Min(expr) -> expr.get_column_refs()
+    | Max(expr) -> expr.get_column_refs()
+    | Avg(expr) -> expr.get_column_refs()
+    \ _ -> []
+
+fn (exprs: [Scalar]) get_column_refs_list: [ColumnRef] =
+    match exprs
+    | [head .. tail] -> head.get_column_refs() ++ tail.get_column_refs_list()
+    \ [] -> []
+
+fn (col_refs: [ColumnRef]) only_left_columns(left_len: I64): Bool =
+    match col_refs
+    | [ColumnRef(i) .. tail] ->
+        if i < left_len then
+            tail.only_left_columns(left_len)
+        else
+            false
+    \ [] -> false
+
+[udf]
+fn (column: ColumnRef) is_unique_column(properties: LogicalProperties): Bool
+
+fn (pred: Scalar) only_unique_columns(left_props: LogicalProperties, right_props: LogicalProperties): Bool =
+    match pred
+    | And(children) ->
+      let
+      in
+        children.all(expr -> expr.only_unique_columns(left_props, right_props))
+    | Or(children) -> false
+    | Not(children) -> false
+    \ Equals(left, right) ->
+      let
+        left_col_refs = left.get_column_refs(),
+        right_col_refs = right.get_column_refs(),
+      in
+        left_col_refs.all(col_ref -> col_ref.is_unique_column(left_props))
+        && right_col_refs.all(col_ref -> col_ref.is_unique_column(right_props))
+
+[transform]
+fn (expr: Logical) eliminate_join_under_project_left: Logical? =
+  match expr
+  | Project(child, expressions) -> 
+    let
+      col_refs = expressions.get_column_refs_list(),
+    in
+      match child
+      | Join(left, right, Left, pred) ->
+        let
+          left_props = left.properties(),
+          right_props = right.properties(),
+
+          left_len = left_props#schema#columns.len(),
+        in
+        if col_refs.only_left_columns(left_len)
+        && pred.only_unique_columns(left_properties, right_properties) then
+              Project(left, expressions)
+          else
+              none
+      \ _ -> none
+  \ _ -> none

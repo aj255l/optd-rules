@@ -204,7 +204,8 @@ fn (expr: Scalar) fold_scalar =
   \ _ -> expr
 
 [transform]
-fn (plan : Logical) fold_constants: Logical? = match plan
+fn (plan : Logical) fold_constants: Logical? =
+  match plan
   | Join(left, right, type, pred) ->
       Join(left, right, type, pred.fold_scalar())
   | Filter(child, pred) ->
