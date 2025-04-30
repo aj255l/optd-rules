@@ -1,0 +1,58 @@
+data Logical 
+
+data JoinType
+
+data Physical
+
+data Catalog
+data LogicalProperties(schema: Schema)
+data PhysicalProperties(order_by: [Bool])  // e.g., define sorting, partitioning, etc.
+data CostedProperties    // e.g., define cost model, statistics, etc.
+data Statistics          // e.g., define histograms, MCVs, etc.
+
+data Schema(columns: [Column])
+data Column(name: String, data_type: String, is_nullable: Bool)
+
+data Scalar =
+    | Literal =
+        | IntLiteral(value: I64)
+        | StringLiteral(value: String)
+        \ BoolLiteral(value: Bool)
+    \ Arithmetic =
+        | Mult(left: Scalar, right: Scalar)
+        | Add(left: Scalar, right: Scalar)
+        | Sub(left: Scalar, right: Scalar)
+        \ Div(left: Scalar, right: Scalar)
+
+fn do_stuff_to_literals(i : Literal): Literal =
+    match i
+    | IntLiteral(v) -> i
+    | StringLiteral(v) -> i
+    \ BoolLiteral(v) -> i
+
+fn do_stuff_to_arith(a : Arithmetic): Arithmetic =
+    match a
+    | Mult(left, right) -> a
+    | Add(left, right) -> a
+    | Sub(left, right) -> a
+    \ Div(left, right) -> a
+
+fn test(x : Scalar): Scalar =
+    match x
+    | IntLiteral(v) -> do_stuff_to_literals(IntLiteral(v))
+    | StringLiteral(v) -> do_stuff_to_literals(StringLiteral(v))
+    | BoolLiteral(v) -> do_stuff_to_literals(BoolLiteral(v))
+    | Mult(left, right) -> do_stuff_to_arith(Mult(left, right))
+    | Sub(left, right) -> do_stuff_to_arith(Sub(left, right))
+    | Add(left, right) -> do_stuff_to_arith(Add(left, right))
+    \ Div(left, right) -> do_stuff_to_arith(Div(left, right))
+
+// fn test(x : Scalar): Scalar =
+//     match x
+//     | IntLiteral(v) -> do_stuff_to_literals(x)
+//     | StringLiteral(v) -> do_stuff_to_literals(x)
+//     | BoolLiteral(v) -> do_stuff_to_literals(x)
+//     | Mult(left, right) -> do_stuff_to_arith(x)
+//     | Sub(left, right) -> do_stuff_to_arith(x)
+//     | Add(left, right) -> do_stuff_to_arith(x)
+//     \ Div(left, right) -> do_stuff_to_arith(x)

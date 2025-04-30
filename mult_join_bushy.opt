@@ -1,0 +1,225 @@
+data Logical = 
+    | Join(left: Logical, right: Logical, type: JoinType, predicate: Scalar)
+    | Filter(child: Logical, predicate: Scalar)
+    | Project(child: Logical, expressions: [Scalar])
+    | Sort(child: Logical, order_by: [Bool]) // true is ascending
+    | MultiJoin(inputs: [Logical], types: [JoinType], predicates: [(I64, I64, Scalar)]) // (left, right, predicate)
+    \ Get(table_name: String)
+
+data Scalar =
+    | ColumnRef(idx: I64)
+    | Literal =
+        | IntLiteral(value: I64)
+        | StringLiteral(value: String)
+        \ BoolLiteral(value: Bool)
+    | Arithmetic =
+        | Mult(left: Scalar, right: Scalar)
+        | Add(left: Scalar, right: Scalar)
+        | Sub(left: Scalar, right: Scalar)
+        \ Div(left: Scalar, right: Scalar)
+    | Predicate =
+        | And(children: [Scalar])
+        | Or(children: [Scalar])
+        | Not(child: Scalar)
+        \ Equals(left: Scalar, right: Scalar)
+    | Function =
+        | Cast(expr: Scalar, target_type: String)
+        | Substring(str: Scalar, start: Scalar, length: Scalar)
+        \ Concat(args: [Scalar])
+    \ AggregateExpr =
+        | Sum(expr: Scalar)
+        | Count(expr: Scalar)
+        | Min(expr: Scalar)
+        | Max(expr: Scalar)
+        \ Avg(expr: Scalar)
+
+data JoinType =
+    | Inner
+    | Left
+    | Right
+    | Full
+    \ Semi
+
+data Physical =
+    | Scan(table_name: String)
+    | PhysFilter(child: Physical, predicate: Scalar)
+    | PhysProject(child: Physical, expressions: [Scalar])
+    | PhysSort(child: Physical, order_by: [Bool]) // true is ascending 
+    \ PhysJoin =
+        | HashJoin(
+                build_side: Physical,
+                probe_side: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+        | MergeJoin(
+                left: Physical,
+                right: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+        \ NestedLoopJoin(
+                outer: Physical,
+                inner: Physical,
+                type: JoinType,
+                predicate: Scalar
+            )
+
+data Catalog
+data LogicalProperties(schema: Schema)
+data PhysicalProperties(order_by: [Bool])  // e.g., define sorting, partitioning, etc.
+data CostedProperties    // e.g., define cost model, statistics, etc.
+data Statistics          // e.g., define histograms, MCVs, etc.
+
+data Schema(columns: [Column])
+data Column(name: String, data_type: String, is_nullable: Bool)
+
+[transform]
+fn (plan: Logical*) multi_join_to_bushy: Logical? = match plan
+  | MultiJoin(inputs, _, predicates) ->
+      let
+          num_inputs = inputs.len(),
+          lengths = range(0, num_inputs).map(i -> inputs[i].properties()#schema#columns.len()),
+          offsets = scan(lengths, 0, (acc, len) -> acc + len),
+
+          vertices = range(0, num_inputs).map(i -> (
+              id: i,
+              inputs: [i],
+              node: inputs[i],
+              offset: offsets[i],
+              len: lengths[i],
+              cost: inputs[i].cost()
+          )),
+
+          grouped_edges = group_predicates(predicates),
+
+          edges = grouped_edges.map(e -> (
+              i: e#i,
+              j: e#j,
+              preds: e#preds,
+              selectivity: e#preds.map(p -> estimate_selectivity(p)).fold(1.0, (a, b) -> a * b),
+              factors: [e#i, e#j]
+          )),
+
+          final = greedy_join(vertices, edges)
+      in
+          Project(final#node, range(0, final#len).map(i -> ColumnRef(i)))
+  \ _ -> none
+
+[udf]
+fn estimate_selectivity(pred: Scalar): F64
+
+fn (node: Logical*) cost: F64
+
+fn join_cost(left: F64, right: F64, sel: F64): F64 = left * right * sel
+
+fn (expr: Scalar) remap(map: {I64 : I64}): Scalar = match expr
+  | ColumnRef(idx) ->
+      if map.contains(idx) then ColumnRef(map(idx)) else ColumnRef(idx)
+  | IntLiteral(value) -> IntLiteral(value)
+  | StringLiteral(value) -> StringLiteral(value)
+  | BoolLiteral(value) -> BoolLiteral(value)
+  | Mult(left, right) -> Mult(left.remap(map), right.remap(map))
+  | Add(left, right) -> Add(left.remap(map), right.remap(map))
+  | Sub(left, right) -> Sub(left.remap(map), right.remap(map))
+  | Div(left, right) -> Div(left.remap(map), right.remap(map))
+  | And(children) -> And(children.map(c -> c.remap(map)))
+  | Or(children) -> Or(children.map(c -> c.remap(map)))
+  | Not(child) -> Not(child.remap(map))
+  | Equals(left, right) -> Equals(left.remap(map), right.remap(map))
+  | Cast(expr, target_type) -> Cast(expr.remap(map), target_type)
+  | Substring(str, start, length) -> Substring(str.remap(map), start.remap(map), length.remap(map))
+  | Concat(args) -> Concat(args.map(a -> a.remap(map)))
+  | Sum(expr) -> Sum(expr.remap(map))
+  | Count(expr) -> Count(expr.remap(map))
+  | Min(expr) -> Min(expr.remap(map))
+  | Max(expr) -> Max(expr.remap(map))
+  | Avg(expr) -> Avg(expr.remap(map))
+
+// Equivalent of scan (prefix sum)
+fn scan(xs: [I64], init: I64, f: (I64, I64) -> I64): [I64] = match xs
+  | [x .. rest] -> let s = f(init, x) in [init] ++ scan(rest, s, f)
+  \ [] -> [init]
+
+// Equivalent of range(a, b): [a, a+1, ..., b-1]
+fn range(a: I64, b: I64): [I64] =
+  if a >= b then []
+  else [a] ++ range(a + 1, b)
+
+// Fold (reduce)
+fn <T> fold(xs: [T], init: F64, f: (F64, T) -> F64): F64 = match xs
+  | [x .. rest] -> fold(rest, f(init, x), f)
+  \ [] -> init
+
+// Group multiple predicates between same inputs
+fn group_predicates(predicates: [(I64, I64, Scalar)]): [(i: I64, j: I64, preds: [Scalar])] =
+  match predicates
+    | [head .. tail] ->
+        let rest_grouped = group_predicates(tail),
+            same = rest_grouped.find(g -> (g#i == head#_0 && g#j == head#_1) || (g#i == head#_1 && g#j == head#_0))
+        in if same != none then
+              rest_grouped.map(g ->
+                  if (g#i == head#_0 && g#j == head#_1) || (g#i == head#_1 && g#j == head#_0) then
+                    (i: g#i, j: g#j, preds: g#preds ++ [head#_2])
+                  else g
+              )
+           else
+              [{ i: head#_0, j: head#_1, preds: [head#_2] }] ++ rest_grouped
+    \ [] -> []
+
+fn greedy_join(
+  vertices: [(id: I64, inputs: [I64], node: Logical, offset: I64, len: I64, cost: F64)],
+  edges: [(i: I64, j: I64, preds: [Scalar], selectivity: F64, factors: [I64])]
+): (id: I64, inputs: [I64], node: Logical, offset: I64, len: I64, cost: F64) =
+  match edges
+    | [edge .. rest] ->
+        let
+            left = vertices.find(v -> v.inputs.contains(edge.i)),
+            right = vertices.find(v -> v.inputs.contains(edge.j)),
+
+            left_remap = (0..left#len).map(i -> (i, i)),
+            right_remap = (0..right#len).map(i -> (i, left#len + i)),
+            remap_map = (left_remap ++ right_remap).to_map(),
+
+            remapped_preds = edge.preds.map(p -> p.remap(remap_map)),
+            combined_pred = remapped_preds.fold(remapped_preds[0], (a, b) -> And([a, b])),
+
+            join_node = Join(left#node, right#node, Inner, combined_pred),
+            new_len = left#len + right#len,
+            new_cost = join_cost(left#cost, right#cost, edge.selectivity),
+
+            new_vertex = (
+                id: vertices.len(),
+                inputs: left#inputs ++ right#inputs,
+                node: join_node,
+                offset: left#offset,
+                len: new_len,
+                cost: new_cost
+            ),
+
+            updated_vertices = vertices.filter(v -> v.id != left#id && v.id != right#id) ++ [new_vertex],
+
+            updated_edges = rest.map(e -> (
+                i: if left#inputs.contains(e.i) || right#inputs.contains(e.i) then new_vertex#id else e.i,
+                j: if left#inputs.contains(e.j) || right#inputs.contains(e.j) then new_vertex#id else e.j,
+                preds: e.preds,
+                selectivity: e.preds.map(p -> estimate_selectivity(p)).fold(1.0, (a, b) -> a * b),
+                factors: [e.i, e.j]
+            )).filter(e -> e.i != e.j),
+
+            sorted_edges = sort_by(updated_edges, e -> join_cost(
+                updated_vertices.find(v -> v.id == e.i)#cost,
+                updated_vertices.find(v -> v.id == e.j)#cost,
+                e.selectivity
+            ))
+        in
+            greedy_join(updated_vertices, sorted_edges)
+    \ [] -> vertices[0]
+
+// Sort by key function
+fn <T> sort_by(xs: [T], key: (T) -> F64): [T] = match xs
+  | [x .. rest] ->
+      let smaller = rest.filter(y -> key(y) < key(x)),
+          larger = rest.filter(y -> key(y) >= key(x))
+      in sort_by(smaller, key) ++ [x] ++ sort_by(larger, key)
+  \ [] -> []
